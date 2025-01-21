@@ -1,92 +1,97 @@
-import requests
 import math
+import requests
+from flask import Flask, jsonify, request
 
-# Hàm tính khoảng cách giữa hai điểm theo vĩ độ và kinh độ
+app = Flask(__name__)
+
+BASE_URL = "https://consumer-api.development.dev.woltapi.com/home-assignment-api/v1/venues"
+
+def get_venue_data(venue_slug: str):
+    """ Fetches static and dynamic venue data from the Home Assignment API. """
+    static_url = f"{BASE_URL}/{venue_slug}/static"
+    dynamic_url = f"{BASE_URL}/{venue_slug}/dynamic"
+    
+    static_response = requests.get(static_url)
+    dynamic_response = requests.get(dynamic_url)
+
+    if static_response.status_code != 200 or dynamic_response.status_code != 200:
+        return None, None
+
+    static_data = static_response.json()
+    dynamic_data = dynamic_response.json()
+    
+    return static_data, dynamic_data
+
+
 def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371  # Bán kính trái đất tính theo km
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
+    """ Calculate the straight-line distance between two points (in meters). """
+    R = 6371  # Radius of the Earth in kilometers
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    
+    a = math.sin(dlat/2) * math.sin(dlat/2) + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2) * math.sin(dlon/2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    distance = R * c * 1000  # Convert to meters
+    return distance
 
-    a = math.sin(delta_phi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    distance_km = R * c  # khoảng cách theo km
-    distance_m = distance_km * 1000  # chuyển sang mét
-    return distance_m
 
-# Hàm lấy thông tin từ Home Assignment API
-def get_venue_data(venue_slug):
-    static_url = f"https://consumer-api.development.dev.woltapi.com/home-assignment-api/v1/venues/{venue_slug}/static"
-    dynamic_url = f"https://consumer-api.development.dev.woltapi.com/home-assignment-api/v1/venues/{venue_slug}/dynamic"
-
-    static_data = requests.get(static_url).json()
-    dynamic_data = requests.get(dynamic_url).json()
-
-    venue_location = static_data["venue_raw"]["location"]["coordinates"]
-    order_minimum_no_surcharge = dynamic_data["venue_raw"]["delivery_specs"]["order_minimum_no_surcharge"]
-    base_price = dynamic_data["venue_raw"]["delivery_specs"]["delivery_pricing"]["base_price"]
-    distance_ranges = dynamic_data["venue_raw"]["delivery_specs"]["delivery_pricing"]["distance_ranges"]
-
-    return venue_location, order_minimum_no_surcharge, base_price, distance_ranges
-
-# Hàm tính phí giao hàng
-def calculate_delivery_fee(distance, base_price, distance_ranges):
+def calculate_delivery_fee(base_price, distance, distance_ranges):
+    """ Calculate the delivery fee based on distance and pricing rules. """
+    fee = base_price
+    
     for range in distance_ranges:
-        if range["min"] <= distance < range["max"] or range["max"] == 0:
-            fee = base_price + range["a"] + round(range["b"] * distance / 10)
-            return fee
-    return None  # Trường hợp nếu khoảng cách quá xa (không có phạm vi hợp lệ)
+        if range["min"] <= distance < (range["max"] if range["max"] != 0 else float('inf')):
+            fee += range["a"]
+            fee += math.round(range["b"] * distance / 10)
+            break
+    
+    return fee
 
-# Hàm tính giá trị đơn hàng
-def calculate_order_price(venue_slug, cart_value, user_lat, user_lon):
-    # Lấy dữ liệu từ Home Assignment API
-    venue_location, order_minimum_no_surcharge, base_price, distance_ranges = get_venue_data(venue_slug)
 
-    # Tính khoảng cách giữa người dùng và địa điểm
-    venue_lat, venue_lon = venue_location
-    distance = calculate_distance(user_lat, user_lon, venue_lat, venue_lon)
+@app.route('/api/v1/delivery-order-price', methods=['GET'])
+def get_delivery_price():
+    venue_slug = request.args.get('venue_slug')
+    cart_value = int(request.args.get('cart_value'))
+    user_lat = float(request.args.get('user_lat'))
+    user_lon = float(request.args.get('user_lon'))
 
-    # Tính phụ thu đơn hàng nhỏ
+    static_data, dynamic_data = get_venue_data(venue_slug)
+    
+    if not static_data or not dynamic_data:
+        return jsonify({"error": "Failed to retrieve venue data"}), 400
+
+    venue_lat, venue_lon = static_data['venue_raw']['location']['coordinates']
+    order_minimum_no_surcharge = dynamic_data['venue_raw']['delivery_specs']['order_minimum_no_surcharge']
+    base_price = dynamic_data['venue_raw']['delivery_specs']['delivery_pricing']['base_price']
+    distance_ranges = dynamic_data['venue_raw']['delivery_specs']['delivery_pricing']['distance_ranges']
+    
+    # Calculate small order surcharge
     small_order_surcharge = max(0, order_minimum_no_surcharge - cart_value)
 
-    # Tính phí giao hàng
-    delivery_fee = calculate_delivery_fee(distance, base_price, distance_ranges)
-
-    if delivery_fee is None:
-        raise ValueError("Delivery is not possible due to distance being too far.")
-
-    # Tính tổng giá trị đơn hàng
+    # Calculate distance
+    distance = calculate_distance(user_lat, user_lon, venue_lat, venue_lon)
+    
+    # Check if the delivery is possible
+    if distance >= distance_ranges[-1]["min"]:
+        return jsonify({"error": "Delivery is not possible due to distance being too far."}), 400
+    
+    # Calculate delivery fee
+    delivery_fee = calculate_delivery_fee(base_price, distance, distance_ranges)
+    
+    # Calculate total price
     total_price = cart_value + small_order_surcharge + delivery_fee
-
-    # Tạo JSON kết quả
-    return {
+    
+    return jsonify({
         "total_price": total_price,
         "small_order_surcharge": small_order_surcharge,
         "cart_value": cart_value,
         "delivery": {
             "fee": delivery_fee,
-            "distance": round(distance)
+            "distance": int(distance)
         }
-    }
+    })
 
-# Hàm chạy API
-from flask import Flask, request, jsonify
 
-app = Flask(__name__)
-
-@app.route("/api/v1/delivery-order-price", methods=["GET"])
-def delivery_order_price():
-    try:
-        venue_slug = request.args.get("venue_slug")
-        cart_value = int(request.args.get("cart_value"))
-        user_lat = float(request.args.get("user_lat"))
-        user_lon = float(request.args.get("user_lon"))
-
-        result = calculate_order_price(venue_slug, cart_value, user_lat, user_lon)
-        return jsonify(result), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(debug=True)
